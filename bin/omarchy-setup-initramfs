@@ -1,0 +1,293 @@
+#!/bin/bash
+
+set -e
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+print_success() {
+  echo -e "${GREEN}$1${NC}"
+}
+
+print_error() {
+  echo -e "${RED}$1${NC}"
+}
+
+print_info() {
+  echo -e "${YELLOW}$1${NC}"
+}
+
+detect_current_initramfs() {
+  local hooks_file="/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
+
+  if [[ ! -f "$hooks_file" ]]; then
+    print_error "Initramfs configuration file not found: $hooks_file"
+    return 1
+  fi
+
+  local hooks_line=$(grep "^HOOKS=" "$hooks_file" | head -1)
+  if [[ -z "$hooks_line" ]]; then
+    print_error "No HOOKS line found in $hooks_file"
+    return 1
+  fi
+
+  # Extract hooks array content
+  local hooks_content=$(echo "$hooks_line" | sed 's/^HOOKS=(\(.*\))/\1/')
+
+  # Check for systemd hooks
+  if echo "$hooks_content" | grep -q "systemd\|sd-vconsole\|sd-encrypt\|sd-btrfs-overlayfs"; then
+    echo "systemd"
+  else
+    echo "busybox"
+  fi
+}
+
+transform_hooks() {
+  local current_type="$1"
+  local target_type="$2"
+  local hooks_file="/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
+
+  # Read current hooks
+  local hooks_line=$(grep "^HOOKS=" "$hooks_file" | head -1)
+  local hooks_content=$(echo "$hooks_line" | sed 's/^HOOKS=(\(.*\))/\1/')
+
+  # Convert to array for processing
+  local hooks_array
+  mapfile -t hooks_array < <(echo "$hooks_content" | tr ' ' '\n')
+  local new_hooks=()
+
+  for hook in "${hooks_array[@]}"; do
+    case "$current_type" in
+    "busybox")
+      case "$hook" in
+      "udev") new_hooks+=("systemd") ;;
+      "keymap") new_hooks+=("sd-vconsole") ;;
+      "consolefont") continue ;; # Remove consolefont, functionality merged into sd-vconsole
+      "encrypt") new_hooks+=("sd-encrypt") ;;
+      "btrfs-overlayfs") new_hooks+=("sd-btrfs-overlayfs") ;;
+      *) new_hooks+=("$hook") ;;
+      esac
+      ;;
+    "systemd")
+      case "$hook" in
+      "systemd") new_hooks+=("udev") ;;
+      "sd-vconsole") new_hooks+=("keymap" "consolefont") ;;
+      "sd-encrypt") new_hooks+=("encrypt") ;;
+      "sd-btrfs-overlayfs") new_hooks+=("btrfs-overlayfs") ;;
+      *) new_hooks+=("$hook") ;;
+      esac
+      ;;
+    esac
+  done
+
+  # Write new hooks configuration
+  local new_hooks_line="HOOKS=($(
+    IFS=' '
+    echo "${new_hooks[*]}"
+  ))"
+  sudo tee "$hooks_file" >/dev/null <<EOF
+$new_hooks_line
+EOF
+
+  print_success "Updated HOOKS configuration:"
+  print_info "$new_hooks_line"
+}
+
+detect_luks_partition() {
+  local luks_device=""
+  local luks_uuid=""
+  local luks_partuuid=""
+
+  # Check if /dev/mapper/root exists and get the underlying LUKS device
+  if [[ -e "/dev/mapper/root" ]]; then
+    luks_device=$(sudo cryptsetup status root 2>/dev/null | grep "device:" | awk '{print $2}')
+    if [[ -n "$luks_device" ]]; then
+      print_info "Found root LUKS device via mapper: $luks_device"
+    fi
+  fi
+
+  # If mapper approach didn't work, fall back to crypttab
+  if [[ -z "$luks_device" && -f "/etc/crypttab" ]]; then
+    local root_entry=$(grep "^root" /etc/crypttab | head -1)
+    if [[ -n "$root_entry" ]]; then
+      luks_device=$(echo "$root_entry" | awk '{print $2}')
+      print_info "Found root LUKS device in crypttab: $luks_device"
+    fi
+  fi
+
+  # If still no device found, error out
+  if [[ -z "$luks_device" ]]; then
+    print_error "Could not find root LUKS device. Make sure /dev/mapper/root exists or /etc/crypttab has a root entry."
+    return 1
+  fi
+
+  # Get UUID and PARTUUID for the LUKS device
+  luks_uuid=$(sudo blkid -s UUID -o value "$luks_device" 2>/dev/null)
+  luks_partuuid=$(sudo blkid -s PARTUUID -o value "$luks_device" 2>/dev/null)
+
+  if [[ -z "$luks_uuid" || -z "$luks_partuuid" ]]; then
+    print_error "Failed to get UUID/PARTUUID for LUKS device: $luks_device"
+    return 1
+  fi
+
+  print_success "LUKS device detected: $luks_device"
+  print_info "UUID: $luks_uuid, PARTUUID: $luks_partuuid"
+
+  # Return values via global variables (bash limitation)
+  LUKS_UUID="$luks_uuid"
+  LUKS_PARTUUID="$luks_partuuid"
+}
+
+update_kernel_cmdline() {
+  local target_type="$1"
+  local limine_config="/etc/default/limine"
+
+  if [[ ! -f "$limine_config" ]]; then
+    print_error "Limine configuration file not found: $limine_config"
+    return 1
+  fi
+
+  # Read current cmdline
+  local cmdline_line=$(grep "^KERNEL_CMDLINE\[default\]=" "$limine_config" | head -1)
+  local cmdline_content=$(echo "$cmdline_line" | sed 's/^KERNEL_CMDLINE\[default\]=//' | tr -d '"')
+
+  if [[ -z "$cmdline_content" ]]; then
+    print_error "No KERNEL_CMDLINE[default] found in $limine_config"
+    return 1
+  fi
+
+  print_info "Current kernel cmdline: $cmdline_content"
+
+  # Convert to array for processing
+  local cmdline_array
+  mapfile -t cmdline_array < <(echo "$cmdline_content" | tr ' ' '\n')
+  local new_cmdline=()
+
+  for param in "${cmdline_array[@]}"; do
+    case "$target_type" in
+    "busybox")
+      # Replace systemd encryption parameters, keep everything else
+      case "$param" in
+      "rd.luks.name="*)
+        new_cmdline+=("cryptdevice=PARTUUID=$LUKS_PARTUUID:root")
+        print_info "Adding busybox encryption parameter: cryptdevice=PARTUUID=$LUKS_PARTUUID:root"
+        ;;
+      "rd.luks.options="*) continue ;; # Remove systemd LUKS options parameter
+      *) new_cmdline+=("$param") ;;    # Keep all other parameters
+      esac
+      ;;
+    "systemd")
+      # Replace busybox encryption parameter, keep everything else
+      case "$param" in
+      "cryptdevice="*)
+        new_cmdline+=("rd.luks.name=$LUKS_UUID=root")
+        new_cmdline+=("rd.luks.options=tries=0")
+        print_info "Adding systemd encryption parameters: rd.luks.name=$LUKS_UUID=root rd.luks.options=tries=0"
+        ;;
+      *) new_cmdline+=("$param") ;; # Keep all other parameters
+      esac
+      ;;
+    esac
+  done
+
+  # Write new cmdline configuration
+  local new_cmdline_content=$(
+    IFS=' '
+    echo "${new_cmdline[*]}"
+  )
+  sudo sed -i "s|^KERNEL_CMDLINE\[default\]=.*|KERNEL_CMDLINE[default]=\"$new_cmdline_content\"|" "$limine_config"
+
+  print_success "Updated kernel cmdline:"
+  print_info "$new_cmdline_content"
+}
+
+regenerate_initramfs() {
+  print_info "Regenerating initramfs..."
+  if sudo limine-mkinitcpio; then
+    print_success "Initramfs regenerated successfully!"
+  else
+    print_error "Failed to regenerate initramfs!"
+    return 1
+  fi
+}
+
+# Request root access early
+if ! sudo -n true 2>/dev/null; then
+  sudo -v
+fi
+
+# Detect current type
+if ! current_type=$(detect_current_initramfs); then
+  exit 1
+fi
+
+print_info "Current initramfs type: $current_type"
+
+# Present options with current type preselected
+options="Busybox\nSystemd"
+
+if [[ "$current_type" == "busybox" ]]; then
+  selected_type=$(echo -e "$options" | gum choose --selected="Busybox" --header="Select initramfs type")
+else
+  selected_type=$(echo -e "$options" | gum choose --selected="Systemd" --header="Select initramfs type")
+fi
+
+# Check if user cancelled
+if [[ -z "$selected_type" ]]; then
+  print_info "Operation cancelled by user"
+  exit 0
+fi
+
+# Convert selection to lowercase for comparison
+target_type=$(echo "$selected_type" | tr '[:upper:]' '[:lower:]')
+
+# Check if already using the selected type
+if [[ "$current_type" == "$target_type" ]]; then
+  print_info "Already using $target_type initramfs. No changes needed."
+  exit 0
+fi
+
+# Confirm the switch
+print_info "\nSwitching from $current_type to $target_type initramfs..."
+if ! gum confirm "This will modify your initramfs configuration and regenerate it. Continue?"; then
+  print_info "Operation cancelled by user"
+  exit 0
+fi
+
+# Create system snapshot before making changes
+print_info "Creating system snapshot..."
+if ! omarchy-snapshot create; then
+  print_error "Failed to create system snapshot. Aborting for safety."
+  exit 1
+fi
+
+# Detect LUKS partition for kernel cmdline modification
+print_info "Detecting LUKS partition..."
+if ! detect_luks_partition; then
+  print_error "Failed to detect LUKS partition"
+  exit 1
+fi
+
+# Update kernel cmdline parameters
+print_info "Updating kernel cmdline parameters..."
+if ! update_kernel_cmdline "$target_type"; then
+  print_error "Failed to update kernel cmdline parameters"
+  exit 1
+fi
+
+# Transform hooks
+if ! transform_hooks "$current_type" "$target_type"; then
+  print_error "Failed to transform hooks configuration"
+  exit 1
+fi
+
+# Regenerate initramfs
+if ! regenerate_initramfs; then
+  print_error "Failed to regenerate initramfs"
+  exit 1
+fi
+
+print_success "\nSuccessfully switched to $target_type initramfs!"
+print_info "The changes will take effect on the next reboot."
